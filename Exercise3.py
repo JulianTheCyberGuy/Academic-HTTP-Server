@@ -8,6 +8,7 @@ from urllib.parse import unquote
 CRLF = b"\r\n"
 END_HEADERS = b"\r\n\r\n"
 
+#Added PUT to supported methods for this assignment
 SUPPORTED_METHODS = {"GET", "HEAD", "PUT"}
 SUPPORTED_ENCODINGS = {"gzip", "deflate"}
 
@@ -32,6 +33,10 @@ def read_full_request_headers(conn, max_bytes=65536):
     return data
 
 def read_exact_bytes(conn, nbytes, already=b"", max_bytes=10_000_000):
+    """
+    Read exactly nbytes from the socket (used for PUT request bodies).
+    Uses any bytes already received after the headers.
+    """
     if nbytes is None:
         raise ValueError("Missing Content-Length")
 
@@ -53,11 +58,7 @@ def read_exact_bytes(conn, nbytes, already=b"", max_bytes=10_000_000):
 def parse_request(raw_bytes):
     """
     Parses the request line and headers.
-    Accepts GET/HEAD/PUT and supports:
-      - Host (required for HTTP/1.1)
-      - Accept-Encoding (gzip, deflate)
-      - Content-Length (required for PUT)
-      - Content-Type (optional)
+    Supports GET, HEAD, and PUT.
     """
     header_block = raw_bytes.split(END_HEADERS, 1)[0]
     lines = header_block.split(CRLF)
@@ -103,12 +104,12 @@ def parse_request(raw_bytes):
     if version == "HTTP/1.1" and "host" not in headers:
         raise ValueError("Missing Host header (required for HTTP/1.1)")
 
-    #Only allow these headers
+    #Only allow these headers (kept simple for assignment)
     for h in headers:
         if h not in ("host", "accept-encoding", "content-length", "content-type"):
             raise ValueError(f"Unsupported header: {h}")
 
-    #Check Accept-Encoding
+    #Check Accept-Encoding (GET/HEAD only)
     encoding_choice = None
     if "accept-encoding" in headers:
         enc_list = [e.strip().lower() for e in headers["accept-encoding"].split(",") if e.strip()]
@@ -124,14 +125,13 @@ def parse_request(raw_bytes):
         elif "deflate" in enc_list:
             encoding_choice = "deflate"
 
-    #Check Content-Length (required for PUT)
+    #Content-Length (required for PUT)
     content_length = None
     if "content-length" in headers:
         try:
             content_length = int(headers["content-length"])
         except ValueError:
             raise ValueError("Invalid Content-Length (must be an integer)")
-
         if content_length < 0:
             raise ValueError("Invalid Content-Length (must be >= 0)")
 
@@ -179,13 +179,14 @@ def make_response(status_code, reason, headers, body_bytes):
 
 def handle_put(conn, raw, path, docroot, content_length):
     """
-    Basic PUT support:
-      - Requires Content-Length
-      - Reads body bytes
-      - Writes/overwrites a file within docroot
+    Basic PUT:
+      - reads Content-Length bytes
+      - writes/overwrites a file in docroot
+      - returns 201 if created, 200 if overwritten
     """
-    #For PUT, require an explicit file path (do not allow PUT /)
     clean_path = path.split("?", 1)[0]
+
+    #Don't allow PUT / (forces an actual filename)
     if clean_path == "/":
         body = b"400 Bad Request\nPUT requires a file path (ex: /upload.txt)\n"
         resp_headers = {
@@ -244,12 +245,12 @@ def handle_client(conn, addr, docroot):
         raw = read_full_request_headers(conn)
         method, path, version, headers, encoding_choice, content_length = parse_request(raw)
 
-        #PUT: write/update a file in docroot
+        #PUT support (write/update file)
         if method == "PUT":
             handle_put(conn, raw, path, docroot, content_length)
             return
 
-        #GET/HEAD: map path to file in docroot
+        #GET/HEAD support (serve file)
         filepath = safe_file_path(docroot, path, default_index=True)
 
         #File checks
@@ -289,7 +290,7 @@ def handle_client(conn, addr, docroot):
             conn.sendall(make_response(403, "Forbidden", resp_headers, body if method == "GET" else b""))
             return
 
-        #Optional compression
+        #Optional compression (GET/HEAD only)
         content_encoding = None
         out_body = body
 
