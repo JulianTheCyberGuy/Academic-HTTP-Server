@@ -8,11 +8,23 @@ from urllib.parse import unquote
 CRLF = b"\r\n"
 END_HEADERS = b"\r\n\r\n"
 
-#Added PUT to supported methods for this assignment
 SUPPORTED_METHODS = {"GET", "HEAD", "PUT"}
 SUPPORTED_ENCODINGS = {"gzip", "deflate"}
 
 SERVER_NAME = "CIST-Python-HTTP/0.2"
+
+# Toggle: include exception details in error responses (handy for assignments)
+DEBUG = True
+
+
+class HTTPError(Exception):
+    def __init__(self, status_code: int, reason: str, message: str = "", headers: dict | None = None):
+        super().__init__(message or reason)
+        self.status_code = status_code
+        self.reason = reason
+        self.message = message or reason
+        self.headers = headers or {}
+
 
 def read_full_request_headers(conn, max_bytes=65536):
     conn.settimeout(2.0)
@@ -25,12 +37,14 @@ def read_full_request_headers(conn, max_bytes=65536):
         data += chunk
 
         if len(data) > max_bytes:
-            raise ValueError("Request too large")
+            # More specific than 400 for oversized headers
+            raise HTTPError(431, "Request Header Fields Too Large", "Request headers too large")
 
     if END_HEADERS not in data:
-        raise ValueError("Incomplete HTTP request headers")
+        raise HTTPError(400, "Bad Request", "Incomplete HTTP request headers")
 
     return data
+
 
 def read_exact_bytes(conn, nbytes, already=b"", max_bytes=10_000_000):
     """
@@ -38,22 +52,23 @@ def read_exact_bytes(conn, nbytes, already=b"", max_bytes=10_000_000):
     Uses any bytes already received after the headers.
     """
     if nbytes is None:
-        raise ValueError("Missing Content-Length")
+        raise HTTPError(411, "Length Required", "Missing Content-Length")
 
     if nbytes < 0:
-        raise ValueError("Invalid Content-Length (must be >= 0)")
+        raise HTTPError(400, "Bad Request", "Invalid Content-Length (must be >= 0)")
 
     if nbytes > max_bytes:
-        raise ValueError("Request body too large")
+        raise HTTPError(413, "Payload Too Large", "Request body too large")
 
     data = already
     while len(data) < nbytes:
         chunk = conn.recv(min(4096, nbytes - len(data)))
         if not chunk:
-            raise ValueError("Client disconnected before sending full body")
+            raise HTTPError(400, "Bad Request", "Client disconnected before sending full body")
         data += chunk
 
     return data
+
 
 def parse_request(raw_bytes):
     """
@@ -63,106 +78,113 @@ def parse_request(raw_bytes):
     header_block = raw_bytes.split(END_HEADERS, 1)[0]
     lines = header_block.split(CRLF)
 
-    #----- Start line -----
+    # ----- Start line -----
     if len(lines) < 1 or not lines[0]:
-        raise ValueError("Missing request line")
+        raise HTTPError(400, "Bad Request", "Missing request line")
 
     start_line = lines[0].decode("iso-8859-1")
     parts = start_line.split()
 
-    #Must be: METHOD PATH HTTP/VERSION
+    # Must be: METHOD PATH HTTP/VERSION
     if len(parts) != 3:
-        raise ValueError("Bad start-line format (expected: METHOD PATH HTTP/1.1)")
+        raise HTTPError(400, "Bad Request", "Bad start-line format (expected: METHOD PATH HTTP/1.1)")
 
     method, path, version = parts
 
     if method not in SUPPORTED_METHODS:
-        raise ValueError(f"Unsupported method: {method}")
+        raise HTTPError(
+            405,
+            "Method Not Allowed",
+            f"Unsupported method: {method}",
+            headers={"Allow": ", ".join(sorted(SUPPORTED_METHODS))}
+        )
 
     if version not in ("HTTP/1.1", "HTTP/1.0"):
-        raise ValueError(f"Unsupported HTTP version: {version}")
+        raise HTTPError(505, "HTTP Version Not Supported", f"Unsupported HTTP version: {version}")
 
-    #----- Headers -----
+    # ----- Headers -----
     headers = {}
     for line in lines[1:]:
         if line == b"":
-            break  #end of headers
+            break  # end of headers
 
         if b":" not in line:
-            raise ValueError("Bad header format (missing ':')")
+            raise HTTPError(400, "Bad Request", "Bad header format (missing ':')")
 
         name, value = line.split(b":", 1)
         name = name.decode("iso-8859-1").strip().lower()
         value = value.decode("iso-8859-1").strip()
 
         if not name:
-            raise ValueError("Header name was empty")
+            raise HTTPError(400, "Bad Request", "Header name was empty")
 
         headers[name] = value
 
-    #HTTP/1.1 should have Host
+    # HTTP/1.1 should have Host
     if version == "HTTP/1.1" and "host" not in headers:
-        raise ValueError("Missing Host header (required for HTTP/1.1)")
+        raise HTTPError(400, "Bad Request", "Missing Host header (required for HTTP/1.1)")
 
-    #Only allow these headers (kept simple for assignment)
+    # Only allow these headers (kept simple for assignment)
     for h in headers:
         if h not in ("host", "accept-encoding", "content-length", "content-type"):
-            raise ValueError(f"Unsupported header: {h}")
+            raise HTTPError(400, "Bad Request", f"Unsupported header: {h}")
 
-    #Check Accept-Encoding (GET/HEAD only)
+    # Check Accept-Encoding (GET/HEAD only)
     encoding_choice = None
     if "accept-encoding" in headers:
         enc_list = [e.strip().lower() for e in headers["accept-encoding"].split(",") if e.strip()]
 
-        #If any encoding listed is not supported, identify it
+        # If any encoding listed is not supported, identify it (kept strict for assignment)
         for enc in enc_list:
             if enc not in SUPPORTED_ENCODINGS:
-                raise ValueError(f"Unsupported Accept-Encoding: {enc}")
+                raise HTTPError(400, "Bad Request", f"Unsupported Accept-Encoding: {enc}")
 
-        #Choose one (prefer gzip)
+        # Choose one (prefer gzip)
         if "gzip" in enc_list:
             encoding_choice = "gzip"
         elif "deflate" in enc_list:
             encoding_choice = "deflate"
 
-    #Content-Length (required for PUT)
+    # Content-Length (required for PUT)
     content_length = None
     if "content-length" in headers:
         try:
             content_length = int(headers["content-length"])
         except ValueError:
-            raise ValueError("Invalid Content-Length (must be an integer)")
+            raise HTTPError(400, "Bad Request", "Invalid Content-Length (must be an integer)")
         if content_length < 0:
-            raise ValueError("Invalid Content-Length (must be >= 0)")
+            raise HTTPError(400, "Bad Request", "Invalid Content-Length (must be >= 0)")
 
     if method == "PUT" and content_length is None:
-        raise ValueError("Missing Content-Length (required for PUT)")
+        raise HTTPError(411, "Length Required", "Missing Content-Length (required for PUT)")
 
     return method, path, version, headers, encoding_choice, content_length
+
 
 def safe_file_path(docroot, url_path, default_index=True):
     """
     Map /something to a safe file path inside docroot.
     Prevents directory traversal like /../../etc/passwd
     """
-    #Remove query string
+    # Remove query string
     url_path = url_path.split("?", 1)[0]
     url_path = unquote(url_path)
 
     if not url_path.startswith("/"):
-        raise ValueError("Path must start with '/'")
+        raise HTTPError(400, "Bad Request", "Path must start with '/'")
 
-    #Only GET/HEAD should map "/" to "/index.html"
+    # Only GET/HEAD should map "/" to "/index.html"
     if default_index and url_path == "/":
         url_path = "/index.html"
 
     rel = os.path.normpath(url_path.lstrip("/"))
 
-    #Block traversal attempts
+    # Block traversal attempts
     if rel.startswith("..") or os.path.isabs(rel):
-        raise ValueError("Invalid path (possible traversal)")
+        raise HTTPError(400, "Bad Request", "Invalid path (possible traversal)")
 
     return os.path.join(docroot, rel)
+
 
 def make_response(status_code, reason, headers, body_bytes):
     """
@@ -171,11 +193,36 @@ def make_response(status_code, reason, headers, body_bytes):
     response_lines = [f"HTTP/1.1 {status_code} {reason}"]
     for k, v in headers.items():
         response_lines.append(f"{k}: {v}")
-    response_lines.append("")  #Blank line
-    response_lines.append("")  #Ensures \r\n\r\n
+    response_lines.append("")  # Blank line
+    response_lines.append("")  # Ensures \r\n\r\n
 
     head = "\r\n".join(response_lines).encode("iso-8859-1")
     return head + body_bytes
+
+
+def send_error(conn, err: HTTPError):
+    body_text = err.message
+    if DEBUG:
+        # still keep it short
+        body_text = f"{err.status_code} {err.reason}\n{err.message}\n"
+    else:
+        body_text = f"{err.status_code} {err.reason}\n"
+
+    body = body_text.encode("utf-8")
+
+    resp_headers = {
+        "Server": SERVER_NAME,
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Length": str(len(body)),
+        "Connection": "close",
+    }
+
+    # include any extra headers (e.g., Allow)
+    for k, v in err.headers.items():
+        resp_headers[k] = v
+
+    conn.sendall(make_response(err.status_code, err.reason, resp_headers, body))
+
 
 def handle_put(conn, raw, path, docroot, content_length):
     """
@@ -186,27 +233,19 @@ def handle_put(conn, raw, path, docroot, content_length):
     """
     clean_path = path.split("?", 1)[0]
 
-    #Don't allow PUT / (forces an actual filename)
+    # Don't allow PUT / (forces an actual filename)
     if clean_path == "/":
-        body = b"400 Bad Request\nPUT requires a file path (ex: /upload.txt)\n"
-        resp_headers = {
-            "Server": SERVER_NAME,
-            "Content-Type": "text/plain; charset=utf-8",
-            "Content-Length": str(len(body)),
-            "Connection": "close",
-        }
-        conn.sendall(make_response(400, "Bad Request", resp_headers, body))
-        return
+        raise HTTPError(400, "Bad Request", "PUT requires a file path (ex: /upload.txt)")
 
     filepath = safe_file_path(docroot, clean_path, default_index=False)
 
-    #Body bytes may already be in the buffer after headers
+    # Body bytes may already be in the buffer after headers
     remainder = raw.split(END_HEADERS, 1)[1]
     body_bytes = read_exact_bytes(conn, content_length, already=remainder)
 
     existed = os.path.exists(filepath)
 
-    #Create folders if needed
+    # Create folders if needed
     parent = os.path.dirname(filepath)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -215,15 +254,7 @@ def handle_put(conn, raw, path, docroot, content_length):
         with open(filepath, "wb") as f:
             f.write(body_bytes)
     except OSError:
-        body = b"403 Forbidden\nCould not write file\n"
-        resp_headers = {
-            "Server": SERVER_NAME,
-            "Content-Type": "text/plain; charset=utf-8",
-            "Content-Length": str(len(body)),
-            "Connection": "close",
-        }
-        conn.sendall(make_response(403, "Forbidden", resp_headers, body))
-        return
+        raise HTTPError(403, "Forbidden", "Could not write file")
 
     if existed:
         body = b"200 OK\nFile updated\n"
@@ -240,20 +271,21 @@ def handle_put(conn, raw, path, docroot, content_length):
     }
     conn.sendall(make_response(code, reason, resp_headers, body))
 
+
 def handle_client(conn, addr, docroot):
     try:
         raw = read_full_request_headers(conn)
         method, path, version, headers, encoding_choice, content_length = parse_request(raw)
 
-        #PUT support (write/update file)
+        # PUT support (write/update file)
         if method == "PUT":
             handle_put(conn, raw, path, docroot, content_length)
             return
 
-        #GET/HEAD support (serve file)
+        # GET/HEAD support (serve file)
         filepath = safe_file_path(docroot, path, default_index=True)
 
-        #File checks
+        # File checks
         if not os.path.exists(filepath):
             body = b"404 Not Found\n"
             resp_headers = {
@@ -280,17 +312,9 @@ def handle_client(conn, addr, docroot):
             with open(filepath, "rb") as f:
                 body = f.read()
         except OSError:
-            body = b"403 Forbidden\n"
-            resp_headers = {
-                "Server": SERVER_NAME,
-                "Content-Type": "text/plain; charset=utf-8",
-                "Content-Length": str(len(body)),
-                "Connection": "close",
-            }
-            conn.sendall(make_response(403, "Forbidden", resp_headers, body if method == "GET" else b""))
-            return
+            raise HTTPError(403, "Forbidden", "Could not read file")
 
-        #Optional compression (GET/HEAD only)
+        # Optional compression (GET/HEAD only)
         content_encoding = None
         out_body = body
 
@@ -310,23 +334,21 @@ def handle_client(conn, addr, docroot):
         if content_encoding:
             resp_headers["Content-Encoding"] = content_encoding
 
-        #HEAD returns headers only
+        # HEAD returns headers only
         if method == "HEAD":
             conn.sendall(make_response(200, "OK", resp_headers, b""))
         else:
             conn.sendall(make_response(200, "OK", resp_headers, out_body))
 
-    except Exception as e:
-        # Basic "safe" error response
-        msg = f"400 Bad Request\n{e}\n".encode("utf-8")
-        resp_headers = {
-            "Server": SERVER_NAME,
-            "Content-Type": "text/plain; charset=utf-8",
-            "Content-Length": str(len(msg)),
-            "Connection": "close",
-        }
+    except HTTPError as he:
         try:
-            conn.sendall(make_response(400, "Bad Request", resp_headers, msg))
+            send_error(conn, he)
+        except Exception:
+            pass
+    except Exception:
+        # Unexpected error -> 500
+        try:
+            send_error(conn, HTTPError(500, "Internal Server Error", "Unhandled server error"))
         except Exception:
             pass
     finally:
@@ -335,11 +357,12 @@ def handle_client(conn, addr, docroot):
         except Exception:
             pass
 
+
 def main():
     port = 80
     docroot = os.getcwd()
 
-    #Usage: python3 server.py [port] [docroot]
+    # Usage: python3 server.py [port] [docroot]
     if len(sys.argv) >= 2:
         port = int(sys.argv[1])
     if len(sys.argv) >= 3:
@@ -361,6 +384,7 @@ def main():
     while True:
         conn, addr = server.accept()
         handle_client(conn, addr, docroot)
+
 
 if __name__ == "__main__":
     main()
