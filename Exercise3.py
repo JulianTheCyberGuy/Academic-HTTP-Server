@@ -4,6 +4,7 @@ import sys
 import gzip
 import zlib
 from urllib.parse import unquote
+from email.utils import formatdate  # NEW: RFC-compliant Date header
 
 CRLF = b"\r\n"
 END_HEADERS = b"\r\n\r\n"
@@ -189,7 +190,12 @@ def safe_file_path(docroot, url_path, default_index=True):
 def make_response(status_code, reason, headers, body_bytes):
     """
     Build a basic HTTP/1.1 response.
+    Automatically injects RFC-compliant Date header.
     """
+    if "Date" not in headers:
+        headers = dict(headers)  # don't mutate the caller's dict
+        headers["Date"] = formatdate(timeval=None, usegmt=True)
+
     response_lines = [f"HTTP/1.1 {status_code} {reason}"]
     for k, v in headers.items():
         response_lines.append(f"{k}: {v}")
