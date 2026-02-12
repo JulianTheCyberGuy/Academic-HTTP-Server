@@ -14,10 +14,6 @@ SUPPORTED_ENCODINGS = {"gzip", "deflate"}
 SERVER_NAME = "CIST-Python-HTTP/0.2"
 
 def read_full_request_headers(conn, max_bytes=65536):
-    """
-    Poll a buffer until we have a complete HTTP request (headers end with \r\n\r\n).
-    NOTE: This may also capture some body bytes if the client sends them quickly.
-    """
     conn.settimeout(2.0)
     data = b""
 
@@ -36,10 +32,6 @@ def read_full_request_headers(conn, max_bytes=65536):
     return data
 
 def read_exact_bytes(conn, nbytes, already=b"", max_bytes=10_000_000):
-    """
-    Read exactly nbytes from the socket (used for reading PUT bodies).
-    Uses any bytes already received after the headers.
-    """
     if nbytes is None:
         raise ValueError("Missing Content-Length")
 
