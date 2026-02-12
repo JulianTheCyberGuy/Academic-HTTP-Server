@@ -8,14 +8,15 @@ from urllib.parse import unquote
 CRLF = b"\r\n"
 END_HEADERS = b"\r\n\r\n"
 
-SUPPORTED_METHODS = {"GET", "HEAD"}
+SUPPORTED_METHODS = {"GET", "HEAD", "PUT"}
 SUPPORTED_ENCODINGS = {"gzip", "deflate"}
 
-SERVER_NAME = "CIST-Python-HTTP/0.1"
+SERVER_NAME = "CIST-Python-HTTP/0.2"
 
 def read_full_request_headers(conn, max_bytes=65536):
     """
     Poll a buffer until we have a complete HTTP request (headers end with \r\n\r\n).
+    NOTE: This may also capture some body bytes if the client sends them quickly.
     """
     conn.settimeout(2.0)
     data = b""
@@ -34,10 +35,37 @@ def read_full_request_headers(conn, max_bytes=65536):
 
     return data
 
+def read_exact_bytes(conn, nbytes, already=b"", max_bytes=10_000_000):
+    """
+    Read exactly nbytes from the socket (used for reading PUT bodies).
+    Uses any bytes already received after the headers.
+    """
+    if nbytes is None:
+        raise ValueError("Missing Content-Length")
+
+    if nbytes < 0:
+        raise ValueError("Invalid Content-Length (must be >= 0)")
+
+    if nbytes > max_bytes:
+        raise ValueError("Request body too large")
+
+    data = already
+    while len(data) < nbytes:
+        chunk = conn.recv(min(4096, nbytes - len(data)))
+        if not chunk:
+            raise ValueError("Client disconnected before sending full body")
+        data += chunk
+
+    return data
+
 def parse_request(raw_bytes):
     """
     Parses the request line and headers.
-    Only accepts GET/HEAD and only supports Host and Accept-Encoding headers.
+    Accepts GET/HEAD/PUT and supports:
+      - Host (required for HTTP/1.1)
+      - Accept-Encoding (gzip, deflate)
+      - Content-Length (required for PUT)
+      - Content-Type (optional)
     """
     header_block = raw_bytes.split(END_HEADERS, 1)[0]
     lines = header_block.split(CRLF)
@@ -85,7 +113,7 @@ def parse_request(raw_bytes):
 
     #Only allow these headers
     for h in headers:
-        if h not in ("host", "accept-encoding"):
+        if h not in ("host", "accept-encoding", "content-length", "content-type"):
             raise ValueError(f"Unsupported header: {h}")
 
     #Check Accept-Encoding
@@ -104,9 +132,23 @@ def parse_request(raw_bytes):
         elif "deflate" in enc_list:
             encoding_choice = "deflate"
 
-    return method, path, version, headers, encoding_choice
+    #Check Content-Length (required for PUT)
+    content_length = None
+    if "content-length" in headers:
+        try:
+            content_length = int(headers["content-length"])
+        except ValueError:
+            raise ValueError("Invalid Content-Length (must be an integer)")
 
-def safe_file_path(docroot, url_path):
+        if content_length < 0:
+            raise ValueError("Invalid Content-Length (must be >= 0)")
+
+    if method == "PUT" and content_length is None:
+        raise ValueError("Missing Content-Length (required for PUT)")
+
+    return method, path, version, headers, encoding_choice, content_length
+
+def safe_file_path(docroot, url_path, default_index=True):
     """
     Map /something to a safe file path inside docroot.
     Prevents directory traversal like /../../etc/passwd
@@ -118,7 +160,8 @@ def safe_file_path(docroot, url_path):
     if not url_path.startswith("/"):
         raise ValueError("Path must start with '/'")
 
-    if url_path == "/":
+    #Only GET/HEAD should map "/" to "/index.html"
+    if default_index and url_path == "/":
         url_path = "/index.html"
 
     rel = os.path.normpath(url_path.lstrip("/"))
@@ -142,12 +185,80 @@ def make_response(status_code, reason, headers, body_bytes):
     head = "\r\n".join(response_lines).encode("iso-8859-1")
     return head + body_bytes
 
+def handle_put(conn, raw, path, docroot, content_length):
+    """
+    Basic PUT support:
+      - Requires Content-Length
+      - Reads body bytes
+      - Writes/overwrites a file within docroot
+    """
+    #For PUT, require an explicit file path (do not allow PUT /)
+    clean_path = path.split("?", 1)[0]
+    if clean_path == "/":
+        body = b"400 Bad Request\nPUT requires a file path (ex: /upload.txt)\n"
+        resp_headers = {
+            "Server": SERVER_NAME,
+            "Content-Type": "text/plain; charset=utf-8",
+            "Content-Length": str(len(body)),
+            "Connection": "close",
+        }
+        conn.sendall(make_response(400, "Bad Request", resp_headers, body))
+        return
+
+    filepath = safe_file_path(docroot, clean_path, default_index=False)
+
+    #Body bytes may already be in the buffer after headers
+    remainder = raw.split(END_HEADERS, 1)[1]
+    body_bytes = read_exact_bytes(conn, content_length, already=remainder)
+
+    existed = os.path.exists(filepath)
+
+    #Create folders if needed
+    parent = os.path.dirname(filepath)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    try:
+        with open(filepath, "wb") as f:
+            f.write(body_bytes)
+    except OSError:
+        body = b"403 Forbidden\nCould not write file\n"
+        resp_headers = {
+            "Server": SERVER_NAME,
+            "Content-Type": "text/plain; charset=utf-8",
+            "Content-Length": str(len(body)),
+            "Connection": "close",
+        }
+        conn.sendall(make_response(403, "Forbidden", resp_headers, body))
+        return
+
+    if existed:
+        body = b"200 OK\nFile updated\n"
+        code, reason = 200, "OK"
+    else:
+        body = b"201 Created\nFile created\n"
+        code, reason = 201, "Created"
+
+    resp_headers = {
+        "Server": SERVER_NAME,
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Length": str(len(body)),
+        "Connection": "close",
+    }
+    conn.sendall(make_response(code, reason, resp_headers, body))
+
 def handle_client(conn, addr, docroot):
     try:
         raw = read_full_request_headers(conn)
-        method, path, version, headers, encoding_choice = parse_request(raw)
+        method, path, version, headers, encoding_choice, content_length = parse_request(raw)
 
-        filepath = safe_file_path(docroot, path)
+        #PUT: write/update a file in docroot
+        if method == "PUT":
+            handle_put(conn, raw, path, docroot, content_length)
+            return
+
+        #GET/HEAD: map path to file in docroot
+        filepath = safe_file_path(docroot, path, default_index=True)
 
         #File checks
         if not os.path.exists(filepath):
