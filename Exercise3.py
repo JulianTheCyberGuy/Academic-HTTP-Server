@@ -4,7 +4,7 @@ import sys
 import gzip
 import zlib
 from urllib.parse import unquote
-from email.utils import formatdate  # NEW: RFC-compliant Date header
+from email.utils import formatdate  # Date header
 
 CRLF = b"\r\n"
 END_HEADERS = b"\r\n\r\n"
@@ -25,6 +25,31 @@ class HTTPError(Exception):
         self.reason = reason
         self.message = message or reason
         self.headers = headers or {}
+
+
+# NEW: MIME type detection for served files
+def get_mime_type(filepath):
+    ext = os.path.splitext(filepath)[1].lower()
+
+    mime_map = {
+        ".html": "text/html; charset=utf-8",
+        ".htm": "text/html; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".js": "text/javascript; charset=utf-8",
+        ".mjs": "text/javascript; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8",
+        ".xml": "application/xml; charset=utf-8",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".svg": "image/svg+xml",
+        ".ico": "image/x-icon",
+        ".pdf": "application/pdf",
+    }
+
+    return mime_map.get(ext, "application/octet-stream")
 
 
 def read_full_request_headers(conn, max_bytes=65536):
@@ -209,7 +234,6 @@ def make_response(status_code, reason, headers, body_bytes):
 def send_error(conn, err: HTTPError):
     body_text = err.message
     if DEBUG:
-        # still keep it short
         body_text = f"{err.status_code} {err.reason}\n{err.message}\n"
     else:
         body_text = f"{err.status_code} {err.reason}\n"
@@ -331,9 +355,10 @@ def handle_client(conn, addr, docroot):
             out_body = zlib.compress(body)
             content_encoding = "deflate"
 
+        # NEW: Use correct MIME type for served files
         resp_headers = {
             "Server": SERVER_NAME,
-            "Content-Type": "application/octet-stream",
+            "Content-Type": get_mime_type(filepath),
             "Content-Length": str(len(out_body)),
             "Connection": "close",
         }
